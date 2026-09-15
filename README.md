@@ -14,7 +14,7 @@ Control strip:
 - Transpose Down
 - Toggle between Note/Chord mode
 - Cycle Scale (Note mode) and Chord quality (Chord mode)
-- Sustain toggle
+- Sustain cycle (steps through multiple sustain lengths, which can be changed in the code)
 - Panic (all notes off
 
 The Chord mode will cycle through scale and mode, and the chord forms (maj/min/dim/aug/sus2/sus4/7/maj7/m7), 
