@@ -3,8 +3,58 @@
 # Isomorphic Grid MIDI Chord Controller
 # Hardware: Adafruit 8x8 NeoTrellis Feather M4 Kit Pack (adafruit.com/product/1929)
 #           -- four 4x4 NeoTrellis (seesaw) elastomer keypads tiled 2x2,
-#              driven over I2C by a Feather M4 Express, output as class-
-#              compliant USB MIDI (no extra MIDI hardware needed).
+#              driven over I2C by a Feather M4 Express.
+#
+# MIDI OUTPUT -- pick a backend below with MIDI_BACKEND:
+#   "usb"  -- class-compliant USB MIDI. Works when the Feather is plugged
+#             into a computer (or anything else that acts as a genuine USB
+#             HOST). Many small standalone synths (including Roland's AIRA
+#             Compact line, e.g. the S-1) do NOT host other USB devices --
+#             their USB-C port is itself a "device" port meant for a
+#             computer -- so plugging the Feather straight into one of
+#             those will NOT work even though a cable/power connection is
+#             detected. Use "uart" for those.
+#   "uart" -- real 5-pin-DIN-style MIDI over a hardware serial port, wired
+#             out to a 3.5mm TRS jack via a simple 2-resistor circuit (see
+#             below). This is what you want for the S-1 and most other
+#             hardware synths' MIDI IN jacks.
+#
+# TRS MIDI-OUT CIRCUIT (for MIDI_BACKEND = "uart"):
+#   Roland's AIRA Compact gear (S-1, P-6, etc.) uses 3.5mm TRS "Type-A"
+#   MIDI wiring, same polarity as the standard DIN-5 MIDI OUT circuit:
+#     Feather "USB" pin (5V, present while USB-powered)
+#         --[220ohm resistor]--> TRS RING
+#     Feather "TX" pin
+#         --[220ohm resistor]--> TRS TIP
+#     Feather "GND"
+#         -------------------->  TRS SLEEVE
+#   That's it -- no optoisolator needed on the output side. Use a normal
+#   3.5mm TRS-A to TRS-A (or TRS-A to 5-pin-DIN) cable from that jack into
+#   the S-1's MIDI IN. If your board is ever battery-only (no USB 5V
+#   present), swap in the Feather's "3V" pin and drop both resistors to
+#   ~150ohm so loop current stays in a sane range.
+#
+# CV/GATE OUTPUT (optional, CV_GATE_ENABLED below):
+#   Adds real 1V/octave pitch CV + a gate signal for driving Eurorack gear
+#   directly from the same grid, using a Makerfabs Mabee_DAC_GP8413 (2ch,
+#   15-bit, 0-10V, I2C address 0x59 by default -- makerfabs.com/mabee-dac-
+#   gp8413.html) on the SAME I2C bus as the NeoTrellis (just a different
+#   address, no extra wiring for the bus itself). This is a real digital-
+#   to-analog converter, not a MIDI path -- it can't stand in for the UART
+#   MIDI-out circuit above (an I2C DAC is far too slow/imprecise to bit-
+#   bang a 31.25kbaud MIDI bitstream, and its 0-10V swing would overdrive
+#   a MIDI input's current loop anyway). It runs alongside MIDI, not
+#   instead of it.
+#     DAC channel 0 (pitch CV) -> TRS TIP    (through a series resistor,
+#                                              e.g. 1k, is good practice)
+#     DAC channel 1 (gate)     -> TRS RING   (likewise)
+#     DAC GND                  -> TRS SLEEVE
+#   This is a *monophonic* CV/Gate pair even though the grid is polyphonic:
+#   pitch follows last-note-priority (the most recently pressed still-held
+#   pad), gate is high whenever any pad is held. If your board doesn't ACK
+#   at 0x59, check its silkscreen for an address-select jumper and update
+#   DAC_I2C_ADDRESS below. Missing/unwired DAC is handled gracefully --
+#   the grid and MIDI still work fine, just without CV/Gate.
 #
 # ---------------------------------------------------------------------------
 # SETUP
@@ -20,12 +70,20 @@
 #                                copy it if boot raises ImportError)
 #       adafruit_midi/         (adafruit_midi.py + note_on.py, note_off.py,
 #                                control_change.py, ...)
+#    CV/Gate needs no extra library -- adafruit_bus_device is already
+#    required above (it's a dependency of adafruit_seesaw), and the small
+#    GP8413 driver below is included right in this file.
 # 3. Wire/solder the four NeoTrellis boards per the "Tiling" guide
 #    (learn.adafruit.com/adafruit-neotrellis/tiling), addresses 0x2E
 #    (top-left), 0x2F (top-right), 0x30 (bottom-left), 0x31 (bottom-right)
 #    -- set with the A0-A4 solder jumpers on the back of each board.
-# 4. Plug the Feather M4 into USB. It will enumerate as a class-compliant
-#    USB MIDI device -- point your DAW/synth at it, no drivers needed.
+# 4. MIDI_BACKEND = "usb": plug the Feather M4 into USB -- it enumerates as
+#    a class-compliant USB MIDI device, point your DAW/synth at it.
+#    MIDI_BACKEND = "uart": build the TRS-out circuit above, then plug that
+#    jack into your synth's MIDI IN with a TRS-A (or TRS-A-to-DIN) cable.
+# 5. Optional: wire the GP8413 onto the shared I2C bus and into a second
+#    TRS jack per the CV/GATE notes above; leave CV_GATE_ENABLED = False
+#    below until it's wired if you're bringing this up in stages.
 #
 # ---------------------------------------------------------------------------
 # WHAT IT DOES
@@ -52,27 +110,69 @@
 # Control strip (x = 7, top to bottom):
 #   row 7  octave up          row 3  toggle NOTE/CHORD mode
 #   row 6  octave down        row 2  cycle scale (NOTE) / chord quality (CHORD)
-#   row 5  transpose up       row 1  sustain toggle (MIDI CC64)
+#   row 5  transpose up       row 1  cycle sustain length: off/short/med/long/longest
 #   row 4  transpose down     row 0  panic (all notes off)
+#
+# Sustain here is a LOCAL, timed note-off delay (not a MIDI sustain-pedal
+# CC64 message) -- each press of row 1 steps to the next hold length, so
+# notes always let go on their own after a bounded, predictable time
+# instead of ringing until you remember to release a pedal.
 #
 # ---------------------------------------------------------------------------
 
 import time
 
 import board
-import usb_midi
 
 import adafruit_midi
-from adafruit_midi.control_change import ControlChange
 from adafruit_midi.note_off import NoteOff
 from adafruit_midi.note_on import NoteOn
 from adafruit_neotrellis.multitrellis import MultiTrellis
 from adafruit_neotrellis.neotrellis import NeoTrellis
 
 # ---------------------------------------------------------------------------
+# GP8413 CV/GATE DAC DRIVER (minimal, ported from Makerfabs/DFRobot's
+# GP8XXX_IIC reference library's register-level protocol; range is pinned
+# to 0-10V permanently rather than auto-switching, so 1V/octave scaling
+# never changes underneath you mid-performance)
+# ---------------------------------------------------------------------------
+
+from adafruit_bus_device import i2c_device
+
+
+class GP8413:
+    """2-channel 15-bit I2C DAC, 0-10V output, fixed range."""
+
+    _RANGE_REG = 0x01
+    _CH0_REG = 0x02
+    _CH1_REG = 0x04
+    _RANGE_10V = 0x11
+    _RESOLUTION = 0x7FFF  # 15-bit
+
+    def __init__(self, i2c_bus, address=0x59):
+        self._device = i2c_device.I2CDevice(i2c_bus, address)
+        with self._device as i2c:
+            i2c.write(bytes([self._RANGE_REG, self._RANGE_10V]))
+
+    def _write_channel(self, reg, voltage):
+        voltage = max(0.0, min(10.0, voltage))
+        code = int((voltage / 10.0) * self._RESOLUTION)
+        value = (code << 1) & 0xFFFF
+        with self._device as i2c:
+            i2c.write(bytes([reg, value & 0xFF, (value >> 8) & 0xFF]))
+
+    def set_channel0(self, voltage):
+        self._write_channel(self._CH0_REG, voltage)
+
+    def set_channel1(self, voltage):
+        self._write_channel(self._CH1_REG, voltage)
+
+
+# ---------------------------------------------------------------------------
 # CONFIGURATION -- tweak these to taste
 # ---------------------------------------------------------------------------
 
+MIDI_BACKEND = "uart"  # "usb" or "uart" -- see notes at the top of this file
 MIDI_CHANNEL = 1  # 1-16
 NOTE_VELOCITY = 100  # NeoTrellis pads are on/off, not velocity-sensitive
 
@@ -120,11 +220,33 @@ CHORD_QUALITIES = (
 )
 chord_quality_index = 0
 
-BRIGHTNESS = 0.35  # 0.0-1.0, keep modest -- 64 RGB LEDs draw real current
+# Extra ring-on time (seconds) added after a pad is released, cycled with
+# control-strip row 1. Index 0 is "off" -- notes stop the instant you let
+# go, same as if this feature didn't exist.
+SUSTAIN_LEVELS = (0.0, 0.15, 0.4, 1.0, 2.5)
+sustain_level_index = 0
+
+BRIGHTNESS = 0.2  # 0.0-1.0. Keep this modest -- 64 RGB LEDs plus the DAC
+#                    add up to real current. If you see dimming/reddish
+#                    flicker as you press more keys, that's a power
+#                    brownout: lower this further and/or switch from a
+#                    computer's USB port to a proper 5V/1A+ USB power
+#                    adapter (laptop ports are often current-limited well
+#                    below what a fully-lit 8x8 NeoPixel grid can pull).
 BOOT_ANIMATION = True
 
 PLAY_COLS = range(0, 7)  # x = 0..6 are the isomorphic playing surface
 CTRL_COL = 7  # x = 7 is the control strip
+
+# CV/Gate output via an optional Makerfabs Mabee_DAC_GP8413 on the shared
+# I2C bus -- see the CV/GATE OUTPUT notes at the top of this file.
+CV_GATE_ENABLED = True
+DAC_I2C_ADDRESS = 0x59
+CV_REFERENCE_NOTE = 0  # MIDI note that maps to 0V -- kept at 0 so CV can
+#                         never need to go negative (the DAC is 0-10V only)
+CV_MAX_VOLTS = 10.0
+GATE_HIGH_VOLTS = 5.0  # conservative default; raise toward 10V if your
+#                         gate input wants a hotter signal
 
 # ---------------------------------------------------------------------------
 # COLOUR / STATE
@@ -165,10 +287,13 @@ CTRL_DIM = 0.25
 FLASH_SECONDS = 0.15
 
 CHORD_MODE = False
-SUSTAIN_ON = False
 
 # active_notes[(x, y)] = list of MIDI note numbers currently sounding on that pad
 active_notes = {}
+# pending_release[(x, y)] = (list of notes, time.monotonic() deadline) for
+# pads that were released while a sustain level > 0 was selected -- their
+# NoteOff is delayed until the deadline instead of sent immediately
+pending_release = {}
 # ctrl_flash[y] = time.monotonic() deadline until which that control pad
 # stays lit white after a press
 ctrl_flash = {}
@@ -188,7 +313,30 @@ trelli = [
 trellis = MultiTrellis(trelli)
 trellis.brightness = BRIGHTNESS
 
-midi = adafruit_midi.MIDI(midi_out=usb_midi.ports[1], out_channel=MIDI_CHANNEL - 1)
+if MIDI_BACKEND == "uart":
+    import busio
+
+    uart = busio.UART(board.TX, board.RX, baudrate=31250, timeout=0.001)
+    midi = adafruit_midi.MIDI(midi_out=uart, out_channel=MIDI_CHANNEL - 1)
+else:
+    import usb_midi
+
+    midi = adafruit_midi.MIDI(midi_out=usb_midi.ports[1], out_channel=MIDI_CHANNEL - 1)
+
+dac = None
+if CV_GATE_ENABLED:
+    try:
+        dac = GP8413(i2c_bus, address=DAC_I2C_ADDRESS)
+    except (ValueError, OSError):
+        # adafruit_bus_device's I2CDevice raises ValueError (not OSError)
+        # when nothing ACKs at that address -- catch both so a DAC that
+        # isn't wired up (yet) doesn't take the whole controller down.
+        print("GP8413 CV/Gate DAC not found at", hex(DAC_I2C_ADDRESS), "-- continuing without it")
+        dac = None
+
+# held_order tracks (x, y) pads in press order, across both playing modes,
+# purely for the monophonic CV/Gate output -- MIDI polyphony is unaffected.
+held_order = []
 
 # ---------------------------------------------------------------------------
 # MUSIC HELPERS
@@ -215,6 +363,35 @@ def chord_notes_for_pad(x, y):
         if 0 <= n <= 127 and n not in notes:
             notes.append(n)
     return notes
+
+
+def note_to_cv_volts(note):
+    volts = (note - CV_REFERENCE_NOTE) / 12.0
+    return max(0.0, min(CV_MAX_VOLTS, volts))
+
+
+def update_cv_gate():
+    global dac
+    if not (CV_GATE_ENABLED and dac):
+        return
+    try:
+        if held_order:
+            top_notes = active_notes.get(held_order[-1])
+            if top_notes:
+                dac.set_channel0(note_to_cv_volts(top_notes[0]))
+            dac.set_channel1(GATE_HIGH_VOLTS)
+        else:
+            # Gate drops, but pitch CV is deliberately left at its last
+            # value (standard CV/sequencer behaviour) rather than
+            # snapping to 0V.
+            dac.set_channel1(0.0)
+    except OSError:
+        # A runtime I2C hiccup (bus contention, marginal power, a jostled
+        # wire) must never take the whole controller down over an optional
+        # peripheral -- drop the DAC for the rest of this session, same as
+        # if it had never been found at startup.
+        print("GP8413 CV/Gate write failed -- disabling CV/Gate for this session")
+        dac = None
 
 
 def in_scale(pitch_class):
@@ -252,7 +429,14 @@ def draw_ctrl_pad(y, force_white=False):
         trellis.color(CTRL_COL, y, WHITE)
         return
     _, color = CTRL_ROWS[y]
-    active = (y == 3 and CHORD_MODE) or (y == 1 and SUSTAIN_ON)
+    if y == 1:
+        # Brightness steps up with the selected sustain level so you can
+        # see how much is dialed in at a glance; level 0 looks like any
+        # other idle control pad.
+        frac = CTRL_DIM if sustain_level_index == 0 else 0.4 + 0.15 * sustain_level_index
+        trellis.color(CTRL_COL, y, tuple(int(c * frac) for c in color))
+        return
+    active = y == 3 and CHORD_MODE
     if active:
         trellis.color(CTRL_COL, y, color)
     else:
@@ -271,13 +455,12 @@ def draw_all_ctrl_pads():
 
 
 def panic():
-    global SUSTAIN_ON
     for note in range(128):
         midi.send(NoteOff(note, 0))
     active_notes.clear()
-    if SUSTAIN_ON:
-        SUSTAIN_ON = False
-        midi.send(ControlChange(64, 0))
+    pending_release.clear()
+    held_order.clear()
+    update_cv_gate()
 
 
 # ---------------------------------------------------------------------------
@@ -287,19 +470,36 @@ def panic():
 
 def play_callback(x, y, edge):
     if edge == NeoTrellis.EDGE_RISING:
+        # If this pad is still ringing out from a previous release, cut
+        # that off now rather than letting it stack with the new notes.
+        old_notes, _ = pending_release.pop((x, y), (None, None))
+        if old_notes:
+            midi.send([NoteOff(n, 0) for n in old_notes])
+
         notes = chord_notes_for_pad(x, y) if CHORD_MODE else [note_for_pad(x, y)]
         active_notes[(x, y)] = notes
         midi.send([NoteOn(n, NOTE_VELOCITY) for n in notes])
         draw_play_pad(x, y, pressed=True)
+        if (x, y) not in held_order:
+            held_order.append((x, y))
+        update_cv_gate()
     elif edge == NeoTrellis.EDGE_FALLING:
         notes = active_notes.pop((x, y), [])
-        if notes:
+        if (x, y) in held_order:
+            held_order.remove((x, y))
+        update_cv_gate()
+        if not notes:
+            return
+        hold = SUSTAIN_LEVELS[sustain_level_index]
+        if hold <= 0:
             midi.send([NoteOff(n, 0) for n in notes])
+        else:
+            pending_release[(x, y)] = (notes, time.monotonic() + hold)
         draw_play_pad(x, y, pressed=False)
 
 
 def ctrl_callback(x, y, edge):
-    global OCTAVE_OFFSET, ROOT_NOTE, CHORD_MODE, SUSTAIN_ON
+    global OCTAVE_OFFSET, ROOT_NOTE, CHORD_MODE, sustain_level_index
     global scale_index, chord_quality_index
 
     if edge != NeoTrellis.EDGE_RISING:
@@ -321,8 +521,7 @@ def ctrl_callback(x, y, edge):
         else:
             scale_index = (scale_index + 1) % len(SCALE_NAMES)
     elif y == 1:
-        SUSTAIN_ON = not SUSTAIN_ON
-        midi.send(ControlChange(64, 127 if SUSTAIN_ON else 0))
+        sustain_level_index = (sustain_level_index + 1) % len(SUSTAIN_LEVELS)
     elif y == 0:
         panic()
 
@@ -336,6 +535,14 @@ def flush_ctrl_flash():
     for y in [y for y, deadline in ctrl_flash.items() if now >= deadline]:
         del ctrl_flash[y]
         draw_ctrl_pad(y)
+
+
+def flush_pending_releases():
+    now = time.monotonic()
+    done = [key for key, (_, deadline) in pending_release.items() if now >= deadline]
+    for key in done:
+        notes, _ = pending_release.pop(key)
+        midi.send([NoteOff(n, 0) for n in notes])
 
 
 # ---------------------------------------------------------------------------
@@ -368,4 +575,5 @@ while True:
     # 17ms or so.
     trellis.sync()
     flush_ctrl_flash()
+    flush_pending_releases()
     time.sleep(0.02)
