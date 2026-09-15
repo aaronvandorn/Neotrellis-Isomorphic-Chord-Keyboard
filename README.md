@@ -20,4 +20,7 @@ Control strip:
 The Chord mode will cycle through scale and mode, and the chord forms (maj/min/dim/aug/sus2/sus4/7/maj7/m7), 
 and you can optionally select different layouts (Wicki-Hayden, thirds) in the file.
 
+This code has also includes instructions on how to add a TRS MIDI out based on a simple circuit, and how to 
+add a DAC connection to output CV signals via the 12C connectors on the Neotrellis PCBs.
+
 To install, place the code.py file into the root directory of the Neotrellis. 
